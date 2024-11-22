@@ -1,3 +1,7 @@
+"""
+wip
+This script removes blue frames from a video file using FFmpeg.
+"""
 import os
 import sys
 import time

@@ -1,3 +1,13 @@
+"""
+wip
+Processing a video file (input_file, reference_img, output_file) 
+    by comparing each frame to a reference image
+    & removing frames that are similar to the reference image || contain specific objects.
+
+- YOLOv5 for object detection
+- Autoencoder for frame comparison
+- Isolation Forest for anomaly detection.
+"""
 import cv2
 import numpy as np
 from moviepy.editor import VideoFileClip
