@@ -1,0 +1,5 @@
+/venv/
+/local/
+temp*
+input.mp4
+output.mp4

@@ -1,116 +1,119 @@
 import cv2
 import numpy as np
 from moviepy.editor import VideoFileClip
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
+import torch
+import torchvision
+from tensorflow.keras.models import load_model
+from sklearn.ensemble import IsolationForest
 import gc
 
-# Define the range of "blue" color
-def is_blue_color(pixel):
-    # Check if blue is significantly higher than green and red
-    blue, green, red = pixel
-    return blue > red and blue > green
+# YOLO Detection (using YOLOv5 with PyTorch)
+def detect_objects(frame):
+    # Load a pre-trained YOLOv5 model (You can use YOLOv4 or any other depending on your setup)
+    model = torch.hub.load("ultralytics/yolov5", "yolov5s")  # Load small model for faster inference
+    results = model(frame)
+    # Perform object detection, filter out unwanted objects
+    detected = results.pandas().xywh[0]
+    return detected
 
-# Threshold to consider a frame as "solid blue"
-threshold = 0.95  # Percentage of blue pixels in the frame (tune this value)
+# Autoencoder to compare frames (simplified)
+def load_autoencoder_model():
+    # Load a pre-trained Autoencoder model (for example, using Keras)
+    return load_model("autoencoder_model.h5")
 
-def is_solid_blue_frame(frame):
-    # Count the number of blue pixels
-    blue_pixels = np.sum([is_blue_color(pixel) for pixel in frame.reshape(-1, 3)])
-    total_pixels = frame.shape[0] * frame.shape[1]  # Total number of pixels in the frame
-    blue_ratio = blue_pixels / total_pixels  # Ratio of blue pixels
-
-    print(f"Blue pixels: {blue_pixels}, Total pixels: {total_pixels}, Blue ratio: {blue_ratio:.4f}")  # Debug print
-
-    return blue_ratio > threshold  # Frame is considered solid blue if > threshold of pixels match blue
-
-def process_frame(frame, frame_number, blue_frames_found):
-    # Check if the frame is solid blue
-    if is_solid_blue_frame(frame):
-        print(f"Solid blue frame detected: Frame {frame_number}")  # Debug print
-        blue_frames_found += 1
-        return None  # Blue frame, we skip it
-    else:
-        print(f"Frame {frame_number} processed.")  # Debug print
-        return frame, blue_frames_found  # Non-blue frame, we keep it
-
-def process_video(input_file, output_file):
-    # Open the input video
-    cap = cv2.VideoCapture(input_file)
+def compare_frame_to_reference(frame, reference_img, autoencoder):
+    # Resize reference image for comparison
+    ref_resized = cv2.resize(reference_img, (frame.shape[1], frame.shape[0]))
     
-    # Check if video opened successfully
+    # Pass both frame and reference image through the Autoencoder to get the reconstruction error
+    frame = np.expand_dims(frame, axis=0) / 255.0
+    ref_resized = np.expand_dims(ref_resized, axis=0) / 255.0
+    
+    # Use Autoencoder to reconstruct both the frame and the reference
+    reconstructed_frame = autoencoder.predict(frame)
+    reconstruction_error = np.mean(np.abs(reconstructed_frame - ref_resized))
+
+    return reconstruction_error
+
+# Frame processing function
+def process_frame(frame_data, reference_img, autoencoder, isolation_forest):
+    frame_number, frame = frame_data
+
+    # Compare the frame to the reference image (autoencoder-based)
+    reconstruction_error = compare_frame_to_reference(frame, reference_img, autoencoder)
+    if reconstruction_error < 0.1:  # If the error is low, it is a match
+        return None  # Frame is similar to the reference and should be removed
+
+    # Object detection with YOLOv5
+    detected_objects = detect_objects(frame)
+    if len(detected_objects) > 0:  # Check if specific objects need removal
+        return None  # If detection logic triggers, remove the frame
+
+    # Isolation Forest for additional anomaly detection (if required)
+    if isolation_forest.predict([frame.flatten()]) == -1:
+        return None  # Anomalous frame, remove it
+
+    # If no issues, keep the frame
+    return (frame_number, frame)
+
+# Video processing
+def process_video(input_file, reference_img, output_file):
+    cap = cv2.VideoCapture(input_file)
     if not cap.isOpened():
         print("Error: Unable to open video.")
         return
 
-    # Load the audio from the original video
-    video = VideoFileClip(input_file)
-    audio = video.audio
-
     # Get video properties
-    fps = video.fps
+    fps = cap.get(cv2.CAP_PROP_FPS)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    print(f"Video properties: FPS = {fps}, Width = {frame_width}, Height = {frame_height}")  # Debug print
-
-    # Set up the VideoWriter for the output file
+    # Prepare output file (compressed video)
+    frame_width, frame_height, fps = 640, 360, 15  # Reduce resolution and FPS for fast processing
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('temp_video.mp4', fourcc, fps, (frame_width, frame_height))
+    out = cv2.VideoWriter(output_file, fourcc, fps, (frame_width, frame_height))
 
+    frames_to_process = []
     total_frames = 0
-    blue_frames_found = 0
 
-    # Use ThreadPoolExecutor for parallel processing, but process frames one at a time to avoid memory overload
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                print("End of video reached or error in reading a frame.")
-                break
-            total_frames += 1
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # Resize frames to reduce memory usage (e.g., downscale by 50%)
-            frame_resized = cv2.resize(frame, (frame_width // 2, frame_height // 2))
+        total_frames += 1
+        frame_resized = cv2.resize(frame, (frame_width, frame_height))  # Resize frame for efficiency
+        frames_to_process.append((total_frames, frame_resized))  # Store frame number and the actual frame
 
-            # Submit frame for processing
-            futures.append(executor.submit(process_frame, frame_resized, total_frames, blue_frames_found))
+    # Load Autoencoder model (pre-trained)
+    autoencoder = load_autoencoder_model()
 
-        # Collect results as they are completed
-        for future in as_completed(futures):
-            result, blue_frames_found = future.result()
-            if result is not None:  # If it's not a blue frame, write it
-                out.write(result)
+    # Initialize Isolation Forest (training it or loading a pre-trained model)
+    isolation_forest = IsolationForest(n_estimators=100)
+    isolation_forest.fit([frame.flatten() for _, frame in frames_to_process])
 
-            # Force garbage collection to free memory
-            gc.collect()
+    # Process frames in parallel
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(process_frame, frame_data, reference_img, autoencoder, isolation_forest) 
+                   for frame_data in frames_to_process]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()  # Get the result of the processed frame
+            if result:  # If not None, keep the frame
+                out.write(result[1])
 
     cap.release()
     out.release()
-    video.close()
+    print(f"Video processing complete. Output saved to {output_file}")
 
-    # Summary of detected frames
-    print(f"Total frames processed: {total_frames}")
-    print(f"Total blue frames found: {blue_frames_found}")
+# Entry point
+def main(input_video_path, reference_image_path, output_video_path):
+    reference_img = cv2.imread(reference_image_path)
+    process_video(input_video_path, reference_img, output_video_path)
 
-    # Reload the temp video for audio synchronization
-    new_video = VideoFileClip('temp_video.mp4')
+# Example usage
+input_video_path = "input.mp4"
+reference_image_path = "reference.jpg"
+output_video_path = "output_filtered.mp4"
 
-    # Calculate the new audio duration based on saved frames
-    audio_duration = (total_frames - blue_frames_found) / fps  # New duration
-    new_audio = audio.subclip(0, audio_duration)  # Keep only the relevant audio
-
-    # Set the audio of the new video to the trimmed audio
-    final_video = new_video.set_audio(new_audio)
-    final_video.write_videofile(output_file, codec='libx264', audio_codec='aac')
-
-    # Cleanup temporary file
-    new_video.close()
-    final_video.close()
-
-# Define input and output video paths
-input_video_path = 'input.mp4'
-output_video_path = 'output_no_signal.mp4'
-
-# Process the video
-process_video(input_video_path, output_video_path)
+main(input_video_path, reference_image_path, output_video_path)
